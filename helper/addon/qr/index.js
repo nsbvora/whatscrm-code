@@ -14,8 +14,13 @@ const {toDataURL} = require("qrcode");
 const {query} = require("../../../database/dbpromise");
 const {processMessage} = require("../../inbox/inbox");
 
+// ---- tiny logger helpers (PM2 friendly) ----
+const TS = () => new Date().toISOString();
+const log = (sid, ...args) => console.log(`[${TS()}] [QR:${sid}]`, ...args);
+const errlog = (sid, ...args) => console.error(`[${TS()}] [QR:${sid}]`, ...args);
+
 function extractUidFromSessionId(input) {
-  return input.split("_")[0]; // Split by underscore and return the first part
+  return input.split("_")[0];
 }
 
 // In-memory session storage for credentials only
@@ -28,44 +33,31 @@ function extractPhoneNumber(str) {
   return match ? match[1] : null;
 }
 
-// Helper: get the session file path using process.cwd()
-const sessionsDir = (sessionId = "") => path.join(process.cwd(), "sessions", sessionId ? `${sessionId}.json` : "");
+// Helper: session FOLDER (not a file). Baileys multi-file auth expects a directory.
+const sessionsDir = (folder = "") => path.join(process.cwd(), "sessions", folder ? `${folder}` : "");
 
 const isSessionExists = sessionId => sessions.has(sessionId);
-const isSessionFileExists = name => fs.existsSync(sessionsDir(name));
+const isSessionFolderExists = name => fs.existsSync(sessionsDir(name));
 
 const shouldReconnect = sessionId => {
   const maxRetries = 5;
   let attempts = retries.get(sessionId) || 0;
   if (attempts < maxRetries) {
     retries.set(sessionId, attempts + 1);
-    console.log("Reconnecting...", {attempts: attempts + 1, sessionId});
+    log(sessionId, "Reconnecting… attempt", attempts + 1, "/", maxRetries);
     return true;
   }
+  log(sessionId, "Max reconnect attempts reached. Will not reconnect.");
   return false;
 };
 
 /**
  * Creates a new WhatsApp session and sets up event listeners.
  *
- * This async function immediately returns once the session is initiated,
- * without waiting for the connection (QR scanning, etc.) to complete.
- *
- * If a QR code is generated during connection, and if an optional `onQr`
- * callback is provided in options, it will be called with the QR code (as a Data URL).
- *
- * If the session is not scanned within 60 seconds, it will log out and delete itself.
- *
- * Before starting, if an existing session file is found for this sessionId,
- * it is deleted to force a fresh session.
- *
- * @param {string} sessionId - Unique session identifier.
- * @param {boolean} [isLegacy=false] - (Unused legacy flag).
- * @param {object} [options={}] - Additional options.
- * @param {boolean} [options.getPairCode=false] - (Unused here).
- * @param {boolean} [options.syncFullHistory=false] - (Not used since chats/contacts aren’t stored).
- * @param {function} [options.onQr] - Optional callback to be invoked with QR code.
- * @returns {Promise<string>} Resolves with "Session initiated" immediately.
+ * @param {string} sessionId
+ * @param {string} [title="Chrome"]
+ * @param {boolean} [isLegacy=false]
+ * @param {object} [options={}]
  */
 const createSession = async (
   sessionId,
@@ -73,190 +65,224 @@ const createSession = async (
   isLegacy = false,
   options = {getPairCode: false, syncFullHistory: false, onQr: null}
 ) => {
-  const sessionFile = "md_" + sessionId;
-  const logger = pino({level: "silent"});
-
-  // Commented out store creation since we don't need to save message history.
-  // const store = makeInMemoryStore({ logger });
-  // If you want to enable the store in the future, simply uncomment the above line.
-
-  const {state, saveCreds} = await useMultiFileAuthState(sessionsDir(sessionFile));
-
-  const waConfig = {
-    auth: state,
-    printQRInTerminal: false, // Set to false if you don't want terminal output
-    logger,
-    browser: [title || "Chrome", "", ""],
-    defaultQueryTimeoutMs: 0,
-    markOnlineOnConnect: false,
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 10000,
-    generateHighQualityLinkPreview: true,
-    syncFullHistory: options.syncFullHistory,
-    getMessage: async key => {
-      // With store disabled, this will simply return undefined.
-      // If you want to use the store later, uncomment the lines below.
-      // if (store) {
-      //   const msg = await store.loadMessage(key?.remoteJid, key?.id);
-      //   return msg?.message;
-      // }
-      return undefined;
-    },
-  };
-
-  const wa = makeWASocket(waConfig);
-  // If you decide to re-enable the store in the future, uncomment these lines:
-  // if (!isLegacy) {
-  //   store.readFromFile(sessionsDir(`${sessionId}_store`));
-  //   store.bind(wa.ev);
-  // }
-  sessions.set(sessionId, {...wa, isLegacy /*, store*/});
-  wa.ev.on("creds.update", saveCreds);
-
-  // Optional: Save chats if needed. (Commented out to disable message history storage)
-  // wa.ev.on("chats.set", ({ chats }) => {
-  //   const timestamp = Date.now();
-  //   saveDataToFile(chats, `${timestamp}-chats.json`);
-  //   // If using store: store.chats.insertIfAbsent(...chats);
-  // });
-
-  // Optional: Save contacts from messaging history. (Commented out)
-  // wa.ev.on("messaging-history.set", (data) => {
-  //   const contacts = data.contacts.filter((item) =>
-  //     item.id.endsWith("@s.whatsapp.net")
-  //   );
-  //   if (contacts.length > 0) {
-  //     createJsonFile(`${sessionId}_contacts`, contacts);
-  //   }
-  // });
-
-  // Listen for message updates (e.g., poll updates)
-  wa.ev.on("messages.update", async m => {
-    const message = m[0];
-    if (message?.update?.pollUpdates?.length > 0) {
-      const pollCreation = await waConfig.getMessage(message.key);
-      if (pollCreation) {
-        const pollMessage = getAggregateVotesInPollMessage({
-          message: pollCreation,
-          pollUpdates: message.update.pollUpdates,
-        });
-        console.log("Poll updated:", pollMessage);
-      }
-    } else if (message?.update && message?.key?.remoteJid !== "status@broadcast") {
-      const uid = extractUidFromSessionId(sessionId);
-      if (uid && message?.update?.status) {
-        processMessage({
-          body: message,
-          uid: extractUidFromSessionId(sessionId),
-          origin: "qr",
-          getSession,
-          sessionId,
-          qrType: "update",
-        });
-      }
-      // console.log("Message update received:", message);
-    }
+  const sessionFolder = "md_" + sessionId;
+  log(sessionId, "createSession() start", {
+    node: process.versions.node,
+    cwd: process.cwd(),
+    title,
+    isLegacy,
+    sessionFolder,
+    sessionsPath: sessionsDir(sessionFolder),
   });
 
-  // Log incoming messages
-  wa.ev.on("messages.upsert", async m => {
-    const message = m.messages[0];
-
-    if (message?.key?.remoteJid !== "status@broadcast" && m.type === "notify" && message?.key?.remoteJid?.endsWith("@s.whatsapp.net")) {
-      const uid = extractUidFromSessionId(sessionId);
-      if (uid) {
-        processMessage({
-          body: message,
-          uid: extractUidFromSessionId(sessionId),
-          origin: "qr",
-          getSession,
-          sessionId,
-          qrType: "upsert",
-        });
-      }
+  try {
+    // Ensure the parent "sessions" dir exists (Baileys can create subfolders)
+    const parentDir = sessionsDir();
+    if (!fs.existsSync(parentDir)) {
+      fs.mkdirSync(parentDir, {recursive: true});
+      log(sessionId, "Created parent sessions dir:", parentDir);
     }
-  });
 
-  // Handle connection updates and QR generation asynchronously.
-  wa.ev.on("connection.update", async update => {
-    const {connection, lastDisconnect, qr} = update;
-    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    // Just log the state of the target folder
+    const target = sessionsDir(sessionFolder);
+    if (fs.existsSync(target)) {
+      const st = fs.statSync(target);
+      log(sessionId, "Auth target exists:", target, "isDirectory:", st.isDirectory());
+    } else {
+      log(sessionId, "Auth target does not exist yet (Baileys will create):", target);
+    }
 
-    if (connection === "open") {
-      retries.delete(sessionId);
-      console.log(`Session ${sessionId} connected.`);
-      // Update instance status to ACTIVE in the DB
-      try {
-        const sessionData = getSession(sessionId);
-        const userData = sessionData?.authState?.creds?.me || sessionData.user;
-        console.dir({userData}, {depth: null});
+    const logger = pino({level: "silent"}); // keep Baileys quiet; we add our own logs
 
-        await query("UPDATE instance SET status = ?, number = ?, data = ? WHERE uniqueId = ?", [
-          "ACTIVE",
-          extractPhoneNumber(userData?.id) || null,
-          userData?.id ? JSON.stringify(userData) : null,
-          sessionId,
-        ]);
+    const {state, saveCreds} = await useMultiFileAuthState(target);
+    log(sessionId, "MultiFileAuthState loaded");
 
-        // updateDuplicateInstance({
-        //   sessionId,
-        //   number: extractPhoneNumber(userData?.id),
-        //   userData,
-        // });
-      } catch (error) {
-        console.error("Database update error (open):", error);
-      }
-    } else if (connection === "close") {
-      if (statusCode === DisconnectReason.loggedOut || !shouldReconnect(sessionId)) {
-        console.log(`Session ${sessionId} disconnected permanently.`);
-        // Update instance status to INACTIVE in the DB before deletion
-        try {
-          await query("UPDATE instance SET status = ? WHERE uniqueId = ?", ["INACTIVE", sessionId]);
-        } catch (error) {
-          console.error("Database update error (close):", error);
+    const waConfig = {
+      auth: state,
+      printQRInTerminal: false,
+      logger,
+      browser: [title || "Chrome", "", ""],
+      defaultQueryTimeoutMs: 0,
+      markOnlineOnConnect: false,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
+      generateHighQualityLinkPreview: true,
+      syncFullHistory: options.syncFullHistory,
+      getMessage: async () => undefined,
+    };
+
+    log(sessionId, "Baileys config ready. Connecting…");
+    const wa = makeWASocket(waConfig);
+
+    // keep a reference (avoid spreading instance)
+    sessions.set(sessionId, Object.assign(wa, {isLegacy}));
+    wa.ev.on("creds.update", () => {
+      log(sessionId, "creds.update fired → saving creds");
+      saveCreds().catch(e => errlog(sessionId, "saveCreds error:", e?.stack || e));
+    });
+
+    // Message updates (polls etc.)
+    wa.ev.on("messages.update", async m => {
+      const message = m?.[0];
+      if (!message) return;
+      log(sessionId, "messages.update event:", {
+        hasPollUpdates: !!message?.update?.pollUpdates?.length,
+        remoteJid: message?.key?.remoteJid,
+      });
+
+      if (message?.update?.pollUpdates?.length > 0) {
+        const pollCreation = await waConfig.getMessage(message.key);
+        if (pollCreation) {
+          const pollMessage = getAggregateVotesInPollMessage({
+            message: pollCreation,
+            pollUpdates: message.update.pollUpdates,
+          });
+          log(sessionId, "Poll updated →", pollMessage);
         }
-        deleteSession(sessionId, isLegacy);
+      } else if (message?.update && message?.key?.remoteJid !== "status@broadcast") {
+        const uid = extractUidFromSessionId(sessionId);
+        if (uid && message?.update?.status) {
+          log(sessionId, "messages.update → forwarding to processMessage(qr:update)");
+          processMessage({
+            body: message,
+            uid,
+            origin: "qr",
+            getSession,
+            sessionId,
+            qrType: "update",
+          });
+        }
+      }
+    });
+
+    // Incoming messages
+    wa.ev.on("messages.upsert", async m => {
+      const message = m?.messages?.[0];
+      log(sessionId, "messages.upsert event:", {
+        type: m?.type,
+        hasMessage: !!message,
+        remoteJid: message?.key?.remoteJid,
+      });
+
+      if (message?.key?.remoteJid !== "status@broadcast" && m.type === "notify" && message?.key?.remoteJid?.endsWith("@s.whatsapp.net")) {
+        const uid = extractUidFromSessionId(sessionId);
+        if (uid) {
+          log(sessionId, "messages.upsert → forwarding to processMessage(qr:upsert)");
+          processMessage({
+            body: message,
+            uid,
+            origin: "qr",
+            getSession,
+            sessionId,
+            qrType: "upsert",
+          });
+        }
+      }
+    });
+
+    // Connection + QR lifecycle
+    wa.ev.on("connection.update", async update => {
+      const {connection, lastDisconnect, qr} = update;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      log(sessionId, "connection.update:", {
+        connection,
+        hasQR: !!qr,
+        statusCode,
+        lastDisconnectMsg: lastDisconnect?.error?.message,
+        lastDisconnectStack: lastDisconnect?.error?.stack,
+      });
+
+      if (connection === "open") {
+        retries.delete(sessionId);
+        log(sessionId, "Session connected ✔️");
+        try {
+          const sessionData = getSession(sessionId);
+          // In recent Baileys, user info is on .user after open
+          const userData = sessionData?.user || sessionData?.authState?.creds?.me;
+          log(sessionId, "Connected user data:", userData);
+
+          const number = extractPhoneNumber(userData?.id) || null;
+          const dataJson = userData?.id ? JSON.stringify(userData) : null;
+
+          const q = "UPDATE instance SET status = ?, number = ?, data = ? WHERE uniqueId = ?";
+          const args = ["ACTIVE", number, dataJson, sessionId];
+          log(sessionId, "DB UPDATE on open:", {q, args});
+          await query(q, args);
+          log(sessionId, "DB UPDATE success (ACTIVE)");
+        } catch (e) {
+          errlog(sessionId, "DB update error (open):", e?.stack || e);
+        }
         return;
       }
-      console.log(`Reconnecting session ${sessionId} in ${statusCode === DisconnectReason.restartRequired ? 0 : 5000}ms...`);
-      setTimeout(() => createSession(sessionId, isLegacy, options), statusCode === DisconnectReason.restartRequired ? 0 : 5000);
-    }
 
-    if (qr) {
-      try {
-        const qrCodeImage = await toDataURL(qr);
-        // console.log(`QR code for session ${sessionId}:`, qrCodeImage);
-        // Update instance data with the latest QR code
-        try {
-          await query("UPDATE instance SET qr = ? WHERE uniqueId = ?", [qrCodeImage, sessionId]);
-        } catch (error) {
-          console.error("Database update error (qr):", error);
-        }
-        if (typeof options.onQr === "function") {
-          options.onQr(qrCodeImage);
-        }
-        // Start a 60-second timeout: if not scanned, logout and delete.
-        setTimeout(async () => {
-          const sessionInstance = getSession(sessionId);
-          if (sessionInstance && sessionInstance.state && !sessionInstance.state.creds.registered) {
-            console.log(`Session ${sessionId} was not scanned in time. Logging out and deleting session.`);
-            try {
-              await sessionInstance.logout();
-            } catch (err) {
-              console.error("Error during logout:", err);
-            } finally {
-              deleteSession(sessionId, isLegacy);
-            }
+      if (connection === "close") {
+        log(sessionId, "Connection closed");
+        if (statusCode === DisconnectReason.loggedOut || !shouldReconnect(sessionId)) {
+          log(sessionId, "Logged out or no reconnect → marking INACTIVE & deleting session");
+          try {
+            await query("UPDATE instance SET status = ? WHERE uniqueId = ?", ["INACTIVE", sessionId]);
+            log(sessionId, "DB UPDATE success (INACTIVE)");
+          } catch (e) {
+            errlog(sessionId, "DB update error (close):", e?.stack || e);
           }
-        }, 60000);
-      } catch (error) {
-        console.error("QR processing error:", error);
+          deleteSession(sessionId, isLegacy);
+          return;
+        }
+        const waitMs = statusCode === DisconnectReason.restartRequired ? 0 : 5000;
+        log(sessionId, `Scheduling reconnect in ${waitMs}ms`);
+        setTimeout(() => createSession(sessionId, "Chrome", isLegacy, options), waitMs);
       }
-    }
-  });
 
-  // Immediately return once the session is initiated.
-  return "Session initiated";
+      if (qr) {
+        try {
+          log(sessionId, "QR payload received from Baileys. Converting to data URL…");
+          const qrCodeImage = await toDataURL(qr);
+          log(sessionId, "QR generated (base64 length):", qrCodeImage?.length);
+
+          try {
+            const q2 = "UPDATE instance SET qr = ? WHERE uniqueId = ?";
+            const args2 = [qrCodeImage, sessionId];
+            log(sessionId, "DB UPDATE QR:", {q2, args2_len: [qrCodeImage?.length, sessionId]});
+            await query(q2, args2);
+            log(sessionId, "DB UPDATE success (QR stored)");
+          } catch (e) {
+            errlog(sessionId, "DB update error (qr):", e?.stack || e);
+          }
+
+          if (typeof options.onQr === "function") {
+            log(sessionId, "Invoking options.onQr callback");
+            options.onQr(qrCodeImage);
+          }
+
+          // 60s timeout — if not scanned, clean up
+          setTimeout(async () => {
+            const sessionInstance = getSession(sessionId);
+            const notScanned = sessionInstance && sessionInstance?.authState && !sessionInstance.authState.creds?.registered;
+
+            log(sessionId, "QR scan timeout check → notScanned:", notScanned);
+            if (notScanned) {
+              log(sessionId, "Not scanned in time → logging out & deleting");
+              try {
+                await sessionInstance.logout();
+                log(sessionId, "logout() success");
+              } catch (e) {
+                errlog(sessionId, "Error during logout:", e?.stack || e);
+              } finally {
+                deleteSession(sessionId, isLegacy);
+              }
+            }
+          }, 60000);
+        } catch (e) {
+          errlog(sessionId, "QR processing error:", e?.stack || e);
+        }
+      }
+    });
+
+    return "Session initiated";
+  } catch (e) {
+    errlog(sessionId, "createSession() fatal error:", e?.stack || e);
+    throw e;
+  }
 };
 
 const getSession = sessionId => sessions.get(sessionId) || null;
@@ -276,82 +302,63 @@ const deleteDirectory = directoryPath => {
   }
 };
 
-/**
- * Deletes a session by removing its files and clearing it from memory.
- *
- * @param {string} sessionId - Unique session identifier.
- * @param {boolean} [isLegacy=false]
- */
 const deleteSession = async (sessionId, isLegacy = false) => {
-  const sessionFile = "md_" + sessionId;
-  const storeFile = `${sessionId}_store`;
+  const sessionFolder = "md_" + sessionId;
   const baseDir = process.cwd();
+  log(sessionId, "deleteSession() start", {sessionFolder});
 
   // Remove contacts file if exists
   const contactsPath = path.join(baseDir, "contacts", `${sessionId}.json`);
   if (fs.existsSync(contactsPath)) {
-    fs.unlinkSync(contactsPath);
+    try {
+      fs.unlinkSync(contactsPath);
+      log(sessionId, "Deleted contacts file:", contactsPath);
+    } catch (e) {
+      errlog(sessionId, "Error deleting contacts file:", e?.stack || e);
+    }
   }
-  if (isSessionFileExists(sessionFile)) {
-    deleteDirectory(sessionsDir(sessionFile));
+
+  const folderPath = sessionsDir(sessionFolder);
+  if (isSessionFolderExists(sessionFolder)) {
+    log(sessionId, "Deleting auth folder:", folderPath);
+    deleteDirectory(folderPath);
+  } else {
+    log(sessionId, "Auth folder not found to delete:", folderPath);
   }
-  if (isSessionFileExists(storeFile)) {
-    fs.unlinkSync(sessionsDir(storeFile));
-  }
+
   sessions.delete(sessionId);
   retries.delete(sessionId);
-  // Update instance status to INACTIVE in the DB
+
   try {
     await query("UPDATE instance SET status = ? WHERE uniqueId = ?", ["INACTIVE", sessionId]);
-  } catch (error) {
-    console.error("Database update error (deleteSession):", error);
+    log(sessionId, "DB UPDATE success (INACTIVE) from deleteSession()");
+  } catch (e) {
+    errlog(sessionId, "DB update error (deleteSession):", e?.stack || e);
   }
 };
 
-/**
- * Returns a list of chats for the session.
- * Since we are not using a store for messages, this returns an empty array.
- *
- * @param {string} sessionId
- * @param {boolean} [isGroup=false]
- */
-const getChatList = (sessionId, isGroup = false) => {
+const getChatList = () => {
   return [];
 };
 
-/**
- * Checks whether a JID exists (user or group) using the session.
- *
- * @param {object} session - The WhatsApp session.
- * @param {string} jid - The JID to check.
- * @param {boolean} [isGroup=false]
- */
 const isExists = async (session, jid, isGroup = false) => {
   try {
-    let result;
     if (isGroup) {
-      result = await session.groupMetadata(jid);
-      return Boolean(result.id);
+      const result = await session.groupMetadata(jid);
+      return Boolean(result?.id);
     }
-    [result] = await session.onWhatsApp(jid);
+    let [result] = await session.onWhatsApp(jid);
     if (typeof result === "undefined") {
       const getNum = jid.replace("@s.whatsapp.net", "");
       [result] = await session.onWhatsApp(`+${getNum}`);
     }
     return result?.exists;
   } catch (err) {
-    console.error("isExists error:", err);
+    errlog("GLOBAL", "isExists error:", err?.stack || err);
     return false;
   }
 };
 
-/**
- * Replaces text within brackets with a random item from the comma-separated list.
- *
- * Example: "Hello [Alice,Bob]" may become "Hello Bob"
- *
- * @param {string} inputText
- */
 function replaceWithRandom(inputText) {
   let updatedText = inputText;
   while (updatedText.includes("[") && updatedText.includes("]")) {
@@ -369,57 +376,38 @@ function replaceWithRandom(inputText) {
   return updatedText;
 }
 
-/**
- * Sends a message using the given session.
- *
- * @param {object} session - The WhatsApp session.
- * @param {string} receiver - The recipient JID.
- * @param {object} message - The message object.
- */
 const sendMessage = async (session, receiver, message) => {
   try {
-    console.log("A");
+    log("GLOBAL", "sendMessage() start", {receiver, hasText: !!message?.text});
     if (message?.text) {
-      console.log("B");
       const linkPreview = await getUrlInfo(message?.text, {
         thumbnailWidth: 1024,
         fetchOpts: {timeout: 5000},
         uploadImage: session.waUploadToServer,
       });
-      console.log("C");
       message = {
         text: replaceWithRandom(message?.text),
         linkPreview,
       };
-    } else {
-      console.log("D");
     }
-    console.log("E", {sendingMsg: message});
     if (message?.caption) {
-      console.log("F");
       message = {...message, caption: replaceWithRandom(message?.caption)};
     }
-    console.log("H", {isLegacy: session?.isLegacy || "NA", message});
-    await delay(1000);
-    console.log("I");
-    return session.sendMessage(receiver, message);
+    await delay(300);
+    const resp = await session.sendMessage(receiver, message);
+    log("GLOBAL", "sendMessage() success");
+    return resp;
   } catch (err) {
-    console.error("sendMessage error:", err);
+    errlog("GLOBAL", "sendMessage error:", err?.stack || err);
     return Promise.reject(null);
   }
 };
 
-/**
- * Retrieves group metadata.
- *
- * @param {object} session - The WhatsApp session.
- * @param {string} jid - The group JID.
- */
 const getGroupData = async (session, jid) => {
   try {
     return await session.groupMetadata(jid);
   } catch (err) {
-    console.error("getGroupData error:", err);
+    errlog("GLOBAL", "getGroupData error:", err?.stack || err);
     return Promise.reject(null);
   }
 };
@@ -437,40 +425,31 @@ const formatGroup = group => {
 };
 
 const cleanup = () => {
-  console.log("Running cleanup before exit.");
-  // No store to write out in this version.
+  console.log(`[${TS()}] cleanup() called`);
 };
 
+// Utility for duplicate instances (unchanged from your version)
 function getBeforeUnderscore(str) {
   const index = str.indexOf("_");
-  if (index !== -1) {
-    return str.slice(0, index);
-  }
-  return str; // If no underscore, return the original string
+  return index !== -1 ? str.slice(0, index) : str;
 }
 
 function renameFilesInDirectory(filePath, number, sessionId, newSessionId) {
-  // Read the directory contents
   fs.readdir(filePath, (err, files) => {
     if (err) {
-      console.error("Error reading directory:", err);
+      errlog("GLOBAL", "Error reading directory:", err?.stack || err);
       return;
     }
-
-    // Iterate over each file in the directory
     files.forEach(file => {
-      // Check if the file matches the pattern number_sessionId.json
       if (file.startsWith(`${number}_${sessionId}`) && file.endsWith(".json")) {
         const oldFilePath = path.join(filePath, file);
         const newFileName = `${number}_${newSessionId}.json`;
         const newFilePath = path.join(filePath, newFileName);
-
-        // Rename the file
         fs.rename(oldFilePath, newFilePath, renameErr => {
           if (renameErr) {
-            console.error("Error renaming file:", renameErr);
+            errlog("GLOBAL", "Error renaming file:", renameErr?.stack || renameErr);
           } else {
-            console.log(`Renamed ${file} to ${newFileName}`);
+            log("GLOBAL", `Renamed ${file} to ${newFileName}`);
           }
         });
       }
@@ -480,72 +459,64 @@ function renameFilesInDirectory(filePath, number, sessionId, newSessionId) {
 
 async function updateDuplicateInstance({sessionId, number, userData}) {
   try {
-    console.log({updateDuplicate: number});
+    log(sessionId, "updateDuplicateInstance()", {number, userData});
     const uid = getBeforeUnderscore(sessionId);
     if (!uid) return;
 
-    // check if the number has more instances
     const allInstance = await query(`SELECT * FROM instance WHERE uid = ? AND number = ?`, [uid, number]);
-
     const removeThisInstance = allInstance.filter(instance => instance.uniqueId !== sessionId);
 
     if (removeThisInstance.length > 0) {
-      // Use a for...of loop to properly handle async operations
       for (const instance of removeThisInstance) {
         const insId = instance.uniqueId;
-
-        console.log({insId});
-
-        // logging out other session
+        log(sessionId, "Deleting duplicate instance:", insId);
         await deleteSession(insId);
-
-        // renaming the chats locally
         const convoFilePath = `${__dirname}/../../../conversations/inbox/${uid}`;
         renameFilesInDirectory(convoFilePath, number, insId, sessionId);
-
-        console.log({convoFilePath, number, insId, uid});
-
-        // getting chats from mysql for this number
         const thisChatId = await query(`SELECT * FROM chats WHERE uid = ? AND chat_id LIKE ?`, [uid, `${insId}%`]);
-        console.log({thisChatId});
-
         for (const chat of thisChatId) {
-          console.log(`chatId ${chat.chat_id} updated to ${sessionId}`);
           const newChatId = chat.chat_id.replace(insId, sessionId);
           await query(`UPDATE chats SET chat_id = ? WHERE id = ?`, [newChatId, chat.id]);
-
-          console.log(`old chatid ${chat.chat_id} updated to ${newChatId}`);
+          log(sessionId, `chatId ${chat.chat_id} → ${newChatId}`);
         }
       }
     }
   } catch (err) {
-    console.log(err);
+    errlog(sessionId, "updateDuplicateInstance error:", err?.stack || err);
   }
 }
 
 /**
- * Reads the sessions folder and automatically creates sessions for saved files.
+ * Bootstraps sessions from the sessions/ directory (folders named md_<id>)
  */
 const init = () => {
-  const sessionsPath = path.join(process.cwd(), "sessions");
-  fs.readdir(sessionsPath, (err, files) => {
+  const sessionsPath = sessionsDir();
+  console.log(`[${TS()}] init(): scanning`, sessionsPath);
+  fs.readdir(sessionsPath, (err, items) => {
     if (err) {
-      console.error("Error reading sessions directory:", err);
+      console.error(`[${TS()}] init() read error:`, err?.stack || err);
       return;
     }
-    files.forEach(file => {
-      if (!file.endsWith(".json") || !file.startsWith("md_") || file.includes("_store")) return;
-      const filename = file.replace(".json", "");
-      const isLegacy = !filename.startsWith("md_");
-      const sessionId = isLegacy ? filename.substring(7) : filename.substring(3);
-      createSession(sessionId, isLegacy);
+    items.forEach(name => {
+      const full = path.join(sessionsPath, name);
+      let stat;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        return;
+      }
+      if (!stat.isDirectory()) return;
+      if (!name.startsWith("md_")) return;
+      const sessionId = name.substring(3);
+      console.log(`[${TS()}] init(): booting session`, sessionId);
+      // correct parameter order: (sessionId, title, isLegacy)
+      createSession(sessionId, "Chrome", false);
     });
   });
 };
 
 function checkQr() {
-  const check = true;
-  return check;
+  return true;
 }
 
 module.exports = {
