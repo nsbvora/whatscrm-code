@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const pino = require("pino");
 const makeWASocket = require("@whiskeysockets/baileys").default;
+const {fetchLatestBaileysVersion} = require("@whiskeysockets/baileys");
 const {
   DisconnectReason,
   delay,
@@ -97,11 +98,14 @@ const createSession = async (
     const {state, saveCreds} = await useMultiFileAuthState(target);
     log(sessionId, "MultiFileAuthState loaded");
 
+    const {version, isLatest} = await fetchLatestBaileysVersion();
+    log(sessionId, "Using WA Web version:", version, "isLatest:", isLatest);
     const waConfig = {
       auth: state,
       printQRInTerminal: false,
       logger,
-      browser: [title || "Chrome", "", ""],
+      browser: [title || "Chrome", "122.0.0.0", "Windows 10"],
+      version,
       defaultQueryTimeoutMs: 0,
       markOnlineOnConnect: false,
       connectTimeoutMs: 60000,
