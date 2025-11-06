@@ -249,8 +249,12 @@ const createSession = async (
             const q2 = "UPDATE instance SET qr = ? WHERE uniqueId = ?";
             const args2 = [qrCodeImage, sessionId];
             log(sessionId, "DB UPDATE QR:", {q2, args2_len: [qrCodeImage?.length, sessionId]});
-            await query(q2, args2);
-            log(sessionId, "DB UPDATE success (QR stored)");
+            const r = await query(q2, args2);
+            // log(sessionId, "DB UPDATE success (QR stored)");
+            log(sessionId, "DB UPDATE QR result:", r);
+            setTimeout(async () => {
+              /* 5 minutes */
+            }, 300000);
           } catch (e) {
             errlog(sessionId, "DB update error (qr):", e?.stack || e);
           }
