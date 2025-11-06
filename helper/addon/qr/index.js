@@ -36,7 +36,7 @@ function extractPhoneNumber(str) {
 
 // Helper: session FOLDER (not a file). Baileys multi-file auth expects a directory.
 // const sessionsDir = (folder = "") => path.join(process.cwd(), "sessions", folder ? `${folder}` : "");
-const BASE_SESS_DIR = process.env.SESSIONS_DIR || path.resolve("/home/code/work/whatscrmsession");
+const BASE_SESS_DIR = process.env.SESSIONS_DIR || path.resolve("/var/lib/whatscrm/sessions");
 const sessionsDir = (folder = "") => path.join(BASE_SESS_DIR, folder ? `${folder}` : "");
 
 const isSessionExists = sessionId => sessions.has(sessionId);
