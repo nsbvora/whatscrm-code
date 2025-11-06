@@ -10,9 +10,9 @@ const {
   downloadMediaMessage,
   getUrlInfo,
 } = require("@whiskeysockets/baileys");
-const { toDataURL } = require("qrcode");
-const { query } = require("../../../database/dbpromise");
-const { processMessage } = require("../../inbox/inbox");
+const {toDataURL} = require("qrcode");
+const {query} = require("../../../database/dbpromise");
+const {processMessage} = require("../../inbox/inbox");
 
 function extractUidFromSessionId(input) {
   return input.split("_")[0]; // Split by underscore and return the first part
@@ -28,19 +28,18 @@ function extractPhoneNumber(str) {
   return match ? match[1] : null;
 }
 
-// Helper: get the session file path using process.cwd()
-const sessionsDir = (sessionId = "") =>
-  path.join(process.cwd(), "sessions", sessionId ? `${sessionId}.json` : "");
+// Helper: get the session folder path using process.cwd()
+// NOTE: useMultiFileAuthState expects a DIRECTORY, not a file.
+const sessionsDir = (folder = "") => path.join(process.cwd(), "sessions", folder ? `${folder}` : "");
 
-const isSessionExists = (sessionId) => sessions.has(sessionId);
-const isSessionFileExists = (name) => fs.existsSync(sessionsDir(name));
+const isSessionFolderExists = name => fs.existsSync(sessionsDir(name));
 
-const shouldReconnect = (sessionId) => {
+const shouldReconnect = sessionId => {
   const maxRetries = 5;
   let attempts = retries.get(sessionId) || 0;
   if (attempts < maxRetries) {
     retries.set(sessionId, attempts + 1);
-    console.log("Reconnecting...", { attempts: attempts + 1, sessionId });
+    console.log("Reconnecting...", {attempts: attempts + 1, sessionId});
     return true;
   }
   return false;
@@ -57,11 +56,12 @@ const shouldReconnect = (sessionId) => {
  *
  * If the session is not scanned within 60 seconds, it will log out and delete itself.
  *
- * Before starting, if an existing session file is found for this sessionId,
- * it is deleted to force a fresh session.
+ * Before starting, if an existing session folder is found for this sessionId,
+ * it will be reused (MultiFileAuthState-safe). Delete via deleteSession() to reset.
  *
  * @param {string} sessionId - Unique session identifier.
- * @param {boolean} [isLegacy=false] - (Unused legacy flag).
+ * @param {string} [title="Chrome"] - Browser title for the Baileys client tuple.
+ * @param {boolean} [isLegacy=false] - (Unused legacy flag; kept for compatibility).
  * @param {object} [options={}] - Additional options.
  * @param {boolean} [options.getPairCode=false] - (Unused here).
  * @param {boolean} [options.syncFullHistory=false] - (Not used since chats/contacts aren’t stored).
@@ -72,22 +72,16 @@ const createSession = async (
   sessionId,
   title = "Chrome",
   isLegacy = false,
-  options = { getPairCode: false, syncFullHistory: false, onQr: null }
+  options = {getPairCode: false, syncFullHistory: false, onQr: null}
 ) => {
-  const sessionFile = "md_" + sessionId;
-  const logger = pino({ level: "silent" });
+  const sessionFolder = "md_" + sessionId;
+  const logger = pino({level: "silent"});
 
-  // Commented out store creation since we don't need to save message history.
-  // const store = makeInMemoryStore({ logger });
-  // If you want to enable the store in the future, simply uncomment the above line.
-
-  const { state, saveCreds } = await useMultiFileAuthState(
-    sessionsDir(sessionFile)
-  );
+  const {state, saveCreds} = await useMultiFileAuthState(sessionsDir(sessionFolder));
 
   const waConfig = {
     auth: state,
-    printQRInTerminal: false, // Set to false if you don't want terminal output
+    printQRInTerminal: false,
     logger,
     browser: [title || "Chrome", "", ""],
     defaultQueryTimeoutMs: 0,
@@ -96,47 +90,22 @@ const createSession = async (
     keepAliveIntervalMs: 10000,
     generateHighQualityLinkPreview: true,
     syncFullHistory: options.syncFullHistory,
-    getMessage: async (key) => {
-      // With store disabled, this will simply return undefined.
-      // If you want to use the store later, uncomment the lines below.
-      // if (store) {
-      //   const msg = await store.loadMessage(key?.remoteJid, key?.id);
-      //   return msg?.message;
-      // }
+    getMessage: async key => {
+      // No message store in this build; return undefined.
       return undefined;
     },
   };
 
   const wa = makeWASocket(waConfig);
-  // If you decide to re-enable the store in the future, uncomment these lines:
-  // if (!isLegacy) {
-  //   store.readFromFile(sessionsDir(`${sessionId}_store`));
-  //   store.bind(wa.ev);
-  // }
-  sessions.set(sessionId, { ...wa, isLegacy /*, store*/ });
+  // Keep a reference with a small extension (avoid spreading complex instance)
+  sessions.set(sessionId, Object.assign(wa, {isLegacy}));
   wa.ev.on("creds.update", saveCreds);
 
-  // Optional: Save chats if needed. (Commented out to disable message history storage)
-  // wa.ev.on("chats.set", ({ chats }) => {
-  //   const timestamp = Date.now();
-  //   saveDataToFile(chats, `${timestamp}-chats.json`);
-  //   // If using store: store.chats.insertIfAbsent(...chats);
-  // });
-
-  // Optional: Save contacts from messaging history. (Commented out)
-  // wa.ev.on("messaging-history.set", (data) => {
-  //   const contacts = data.contacts.filter((item) =>
-  //     item.id.endsWith("@s.whatsapp.net")
-  //   );
-  //   if (contacts.length > 0) {
-  //     createJsonFile(`${sessionId}_contacts`, contacts);
-  //   }
-  // });
-
   // Listen for message updates (e.g., poll updates)
-  wa.ev.on("messages.update", async (m) => {
+  wa.ev.on("messages.update", async m => {
     const message = m[0];
     if (message?.update?.pollUpdates?.length > 0) {
+      // Use the getMessage function we provided to Baileys config
       const pollCreation = await waConfig.getMessage(message.key);
       if (pollCreation) {
         const pollMessage = getAggregateVotesInPollMessage({
@@ -145,10 +114,7 @@ const createSession = async (
         });
         console.log("Poll updated:", pollMessage);
       }
-    } else if (
-      message?.update &&
-      message?.key?.remoteJid !== "status@broadcast"
-    ) {
+    } else if (message?.update && message?.key?.remoteJid !== "status@broadcast") {
       const uid = extractUidFromSessionId(sessionId);
       if (uid && message?.update?.status) {
         processMessage({
@@ -160,19 +126,14 @@ const createSession = async (
           qrType: "update",
         });
       }
-      // console.log("Message update received:", message);
     }
   });
 
   // Log incoming messages
-  wa.ev.on("messages.upsert", async (m) => {
-    const message = m.messages[0];
+  wa.ev.on("messages.upsert", async m => {
+    const message = m.messages?.[0];
 
-    if (
-      message?.key?.remoteJid !== "status@broadcast" &&
-      m.type === "notify" &&
-      message?.key?.remoteJid?.endsWith("@s.whatsapp.net")
-    ) {
+    if (message?.key?.remoteJid !== "status@broadcast" && m.type === "notify" && message?.key?.remoteJid?.endsWith("@s.whatsapp.net")) {
       const uid = extractUidFromSessionId(sessionId);
       if (uid) {
         processMessage({
@@ -188,8 +149,8 @@ const createSession = async (
   });
 
   // Handle connection updates and QR generation asynchronously.
-  wa.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  wa.ev.on("connection.update", async update => {
+    const {connection, lastDisconnect, qr} = update;
     const statusCode = lastDisconnect?.error?.output?.statusCode;
 
     if (connection === "open") {
@@ -198,20 +159,18 @@ const createSession = async (
       // Update instance status to ACTIVE in the DB
       try {
         const sessionData = getSession(sessionId);
-        const userData = sessionData?.authState?.creds?.me || sessionData.user;
-        console.dir({ userData }, { depth: null });
+        const userData = sessionData?.user; // populated after "open"
+        console.dir({userData}, {depth: null});
 
-        await query(
-          "UPDATE instance SET status = ?, number = ?, data = ? WHERE uniqueId = ?",
-          [
-            "ACTIVE",
-            extractPhoneNumber(userData?.id) || null,
-            userData?.id ? JSON.stringify(userData) : null,
-            sessionId,
-          ]
-        );
+        await query("UPDATE instance SET status = ?, number = ?, data = ? WHERE uniqueId = ?", [
+          "ACTIVE",
+          extractPhoneNumber(userData?.id) || null,
+          userData?.id ? JSON.stringify(userData) : null,
+          sessionId,
+        ]);
 
-        // updateDuplicateInstance({
+        // Optionally de-duplicate instances:
+        // await updateDuplicateInstance({
         //   sessionId,
         //   number: extractPhoneNumber(userData?.id),
         //   userData,
@@ -220,44 +179,28 @@ const createSession = async (
         console.error("Database update error (open):", error);
       }
     } else if (connection === "close") {
-      if (
-        statusCode === DisconnectReason.loggedOut ||
-        !shouldReconnect(sessionId)
-      ) {
+      if (statusCode === DisconnectReason.loggedOut || !shouldReconnect(sessionId)) {
         console.log(`Session ${sessionId} disconnected permanently.`);
         // Update instance status to INACTIVE in the DB before deletion
         try {
-          await query("UPDATE instance SET status = ? WHERE uniqueId = ?", [
-            "INACTIVE",
-            sessionId,
-          ]);
+          await query("UPDATE instance SET status = ? WHERE uniqueId = ?", ["INACTIVE", sessionId]);
         } catch (error) {
           console.error("Database update error (close):", error);
         }
         deleteSession(sessionId, isLegacy);
         return;
       }
-      console.log(
-        `Reconnecting session ${sessionId} in ${
-          statusCode === DisconnectReason.restartRequired ? 0 : 5000
-        }ms...`
-      );
-      setTimeout(
-        () => createSession(sessionId, isLegacy, options),
-        statusCode === DisconnectReason.restartRequired ? 0 : 5000
-      );
+      const waitMs = statusCode === DisconnectReason.restartRequired ? 0 : 5000;
+      console.log(`Reconnecting session ${sessionId} in ${waitMs}ms...`);
+      setTimeout(() => createSession(sessionId, "Chrome", isLegacy, options), waitMs);
     }
 
     if (qr) {
       try {
         const qrCodeImage = await toDataURL(qr);
-        // console.log(`QR code for session ${sessionId}:`, qrCodeImage);
         // Update instance data with the latest QR code
         try {
-          await query("UPDATE instance SET qr = ? WHERE uniqueId = ?", [
-            qrCodeImage,
-            sessionId,
-          ]);
+          await query("UPDATE instance SET qr = ? WHERE uniqueId = ?", [qrCodeImage, sessionId]);
         } catch (error) {
           console.error("Database update error (qr):", error);
         }
@@ -267,21 +210,22 @@ const createSession = async (
         // Start a 60-second timeout: if not scanned, logout and delete.
         setTimeout(async () => {
           const sessionInstance = getSession(sessionId);
-          if (
-            sessionInstance &&
-            sessionInstance.state &&
-            !sessionInstance.state.creds.registered
-          ) {
-            console.log(
-              `Session ${sessionId} was not scanned in time. Logging out and deleting session.`
-            );
-            try {
-              await sessionInstance.logout();
-            } catch (err) {
-              console.error("Error during logout:", err);
-            } finally {
-              deleteSession(sessionId, isLegacy);
+          try {
+            // If creds are not registered yet, it's not scanned.
+            const notScanned = sessionInstance && sessionInstance?.authState && !sessionInstance.authState.creds?.registered;
+
+            if (notScanned) {
+              console.log(`Session ${sessionId} was not scanned in time. Logging out and deleting session.`);
+              try {
+                await sessionInstance.logout();
+              } catch (err) {
+                console.error("Error during logout:", err);
+              } finally {
+                deleteSession(sessionId, isLegacy);
+              }
             }
+          } catch (err) {
+            console.error("QR timeout check error:", err);
           }
         }, 60000);
       } catch (error) {
@@ -294,12 +238,12 @@ const createSession = async (
   return "Session initiated";
 };
 
-const getSession = (sessionId) => sessions.get(sessionId) || null;
+const getSession = sessionId => sessions.get(sessionId) || null;
 
 // Recursively delete a directory and its contents
-const deleteDirectory = (directoryPath) => {
+const deleteDirectory = directoryPath => {
   if (fs.existsSync(directoryPath)) {
-    fs.readdirSync(directoryPath).forEach((file) => {
+    fs.readdirSync(directoryPath).forEach(file => {
       const filePath = path.join(directoryPath, file);
       if (fs.lstatSync(filePath).isDirectory()) {
         deleteDirectory(filePath);
@@ -318,8 +262,7 @@ const deleteDirectory = (directoryPath) => {
  * @param {boolean} [isLegacy=false]
  */
 const deleteSession = async (sessionId, isLegacy = false) => {
-  const sessionFile = "md_" + sessionId;
-  const storeFile = `${sessionId}_store`;
+  const sessionFolder = "md_" + sessionId;
   const baseDir = process.cwd();
 
   // Remove contacts file if exists
@@ -327,20 +270,17 @@ const deleteSession = async (sessionId, isLegacy = false) => {
   if (fs.existsSync(contactsPath)) {
     fs.unlinkSync(contactsPath);
   }
-  if (isSessionFileExists(sessionFile)) {
-    deleteDirectory(sessionsDir(sessionFile));
+
+  if (isSessionFolderExists(sessionFolder)) {
+    deleteDirectory(sessionsDir(sessionFolder));
   }
-  if (isSessionFileExists(storeFile)) {
-    fs.unlinkSync(sessionsDir(storeFile));
-  }
+
   sessions.delete(sessionId);
   retries.delete(sessionId);
+
   // Update instance status to INACTIVE in the DB
   try {
-    await query("UPDATE instance SET status = ? WHERE uniqueId = ?", [
-      "INACTIVE",
-      sessionId,
-    ]);
+    await query("UPDATE instance SET status = ? WHERE uniqueId = ?", ["INACTIVE", sessionId]);
   } catch (error) {
     console.error("Database update error (deleteSession):", error);
   }
@@ -397,13 +337,10 @@ function replaceWithRandom(inputText) {
     const end = updatedText.indexOf("]");
     if (start !== -1 && end !== -1) {
       const arrayText = updatedText.substring(start + 1, end);
-      const items = arrayText.split(",").map((item) => item.trim());
+      const items = arrayText.split(",").map(item => item.trim());
       if (items.length > 0) {
         const randomItem = items[Math.floor(Math.random() * items.length)];
-        updatedText =
-          updatedText.substring(0, start) +
-          randomItem +
-          updatedText.substring(end + 1);
+        updatedText = updatedText.substring(0, start) + randomItem + updatedText.substring(end + 1);
       }
     }
   }
@@ -424,7 +361,7 @@ const sendMessage = async (session, receiver, message) => {
       console.log("B");
       const linkPreview = await getUrlInfo(message?.text, {
         thumbnailWidth: 1024,
-        fetchOpts: { timeout: 5000 },
+        fetchOpts: {timeout: 5000},
         uploadImage: session.waUploadToServer,
       });
       console.log("C");
@@ -435,12 +372,12 @@ const sendMessage = async (session, receiver, message) => {
     } else {
       console.log("D");
     }
-    console.log("E", { sendingMsg: message });
+    console.log("E", {sendingMsg: message});
     if (message?.caption) {
       console.log("F");
-      message = { ...message, caption: replaceWithRandom(message?.caption) };
+      message = {...message, caption: replaceWithRandom(message?.caption)};
     }
-    console.log("H", { isLegacy: session?.isLegacy || "NA", message });
+    console.log("H", {isLegacy: session?.isLegacy || "NA", message});
     await delay(1000);
     console.log("I");
     return session.sendMessage(receiver, message);
@@ -465,13 +402,13 @@ const getGroupData = async (session, jid) => {
   }
 };
 
-const formatPhone = (phone) => {
+const formatPhone = phone => {
   if (phone.endsWith("@s.whatsapp.net")) return phone;
   let formatted = phone.replace(/\D/g, "");
   return formatted + "@s.whatsapp.net";
 };
 
-const formatGroup = (group) => {
+const formatGroup = group => {
   if (group.endsWith("@g.us")) return group;
   let formatted = group.replace(/[^\d-]/g, "");
   return formatted + "@g.us";
@@ -499,7 +436,7 @@ function renameFilesInDirectory(filePath, number, sessionId, newSessionId) {
     }
 
     // Iterate over each file in the directory
-    files.forEach((file) => {
+    files.forEach(file => {
       // Check if the file matches the pattern number_sessionId.json
       if (file.startsWith(`${number}_${sessionId}`) && file.endsWith(".json")) {
         const oldFilePath = path.join(filePath, file);
@@ -507,7 +444,7 @@ function renameFilesInDirectory(filePath, number, sessionId, newSessionId) {
         const newFilePath = path.join(filePath, newFileName);
 
         // Rename the file
-        fs.rename(oldFilePath, newFilePath, (renameErr) => {
+        fs.rename(oldFilePath, newFilePath, renameErr => {
           if (renameErr) {
             console.error("Error renaming file:", renameErr);
           } else {
@@ -519,28 +456,23 @@ function renameFilesInDirectory(filePath, number, sessionId, newSessionId) {
   });
 }
 
-async function updateDuplicateInstance({ sessionId, number, userData }) {
+async function updateDuplicateInstance({sessionId, number, userData}) {
   try {
-    console.log({ updateDuplicate: number });
+    console.log({updateDuplicate: number});
     const uid = getBeforeUnderscore(sessionId);
     if (!uid) return;
 
     // check if the number has more instances
-    const allInstance = await query(
-      `SELECT * FROM instance WHERE uid = ? AND number = ?`,
-      [uid, number]
-    );
+    const allInstance = await query(`SELECT * FROM instance WHERE uid = ? AND number = ?`, [uid, number]);
 
-    const removeThisInstance = allInstance.filter(
-      (instance) => instance.uniqueId !== sessionId
-    );
+    const removeThisInstance = allInstance.filter(instance => instance.uniqueId !== sessionId);
 
     if (removeThisInstance.length > 0) {
       // Use a for...of loop to properly handle async operations
       for (const instance of removeThisInstance) {
         const insId = instance.uniqueId;
 
-        console.log({ insId });
+        console.log({insId});
 
         // logging out other session
         await deleteSession(insId);
@@ -549,22 +481,16 @@ async function updateDuplicateInstance({ sessionId, number, userData }) {
         const convoFilePath = `${__dirname}/../../../conversations/inbox/${uid}`;
         renameFilesInDirectory(convoFilePath, number, insId, sessionId);
 
-        console.log({ convoFilePath, number, insId, uid });
+        console.log({convoFilePath, number, insId, uid});
 
         // getting chats from mysql for this number
-        const thisChatId = await query(
-          `SELECT * FROM chats WHERE uid = ? AND chat_id LIKE ?`,
-          [uid, `${insId}%`]
-        );
-        console.log({ thisChatId });
+        const thisChatId = await query(`SELECT * FROM chats WHERE uid = ? AND chat_id LIKE ?`, [uid, `${insId}%`]);
+        console.log({thisChatId});
 
         for (const chat of thisChatId) {
           console.log(`chatId ${chat.chat_id} updated to ${sessionId}`);
           const newChatId = chat.chat_id.replace(insId, sessionId);
-          await query(`UPDATE chats SET chat_id = ? WHERE id = ?`, [
-            newChatId,
-            chat.id,
-          ]);
+          await query(`UPDATE chats SET chat_id = ? WHERE id = ?`, [newChatId, chat.id]);
 
           console.log(`old chatid ${chat.chat_id} updated to ${newChatId}`);
         }
@@ -576,28 +502,28 @@ async function updateDuplicateInstance({ sessionId, number, userData }) {
 }
 
 /**
- * Reads the sessions folder and automatically creates sessions for saved files.
+ * Reads the sessions folder and automatically creates sessions for saved folders.
  */
 const init = () => {
   const sessionsPath = path.join(process.cwd(), "sessions");
-  fs.readdir(sessionsPath, (err, files) => {
+  fs.readdir(sessionsPath, (err, items) => {
     if (err) {
       console.error("Error reading sessions directory:", err);
       return;
     }
-    files.forEach((file) => {
-      if (
-        !file.endsWith(".json") ||
-        !file.startsWith("md_") ||
-        file.includes("_store")
-      )
+    items.forEach(name => {
+      const full = path.join(sessionsPath, name);
+      let stat;
+      try {
+        stat = fs.statSync(full);
+      } catch {
         return;
-      const filename = file.replace(".json", "");
-      const isLegacy = !filename.startsWith("md_");
-      const sessionId = isLegacy
-        ? filename.substring(7)
-        : filename.substring(3);
-      createSession(sessionId, isLegacy);
+      }
+      if (!stat.isDirectory()) return;
+      if (!name.startsWith("md_")) return;
+      const sessionId = name.substring(3);
+      // title, isLegacy=false (we only use MD-style multi-file auth)
+      createSession(sessionId, "Chrome", false);
     });
   });
 };
@@ -608,7 +534,7 @@ function checkQr() {
 }
 
 module.exports = {
-  isSessionExists,
+  isSessionExists: sessionId => sessions.has(sessionId),
   createSession,
   getSession,
   deleteSession,
