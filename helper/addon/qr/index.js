@@ -28,11 +28,11 @@ function extractPhoneNumber(str) {
   return match ? match[1] : null;
 }
 
-// Helper: get the session folder path using process.cwd()
-// NOTE: useMultiFileAuthState expects a DIRECTORY, not a file.
-const sessionsDir = (folder = "") => path.join(process.cwd(), "sessions", folder ? `${folder}` : "");
+// Helper: get the session file path using process.cwd()
+const sessionsDir = (sessionId = "") => path.join(process.cwd(), "sessions", sessionId ? `${sessionId}.json` : "");
 
-const isSessionFolderExists = name => fs.existsSync(sessionsDir(name));
+const isSessionExists = sessionId => sessions.has(sessionId);
+const isSessionFileExists = name => fs.existsSync(sessionsDir(name));
 
 const shouldReconnect = sessionId => {
   const maxRetries = 5;
@@ -56,12 +56,11 @@ const shouldReconnect = sessionId => {
  *
  * If the session is not scanned within 60 seconds, it will log out and delete itself.
  *
- * Before starting, if an existing session folder is found for this sessionId,
- * it will be reused (MultiFileAuthState-safe). Delete via deleteSession() to reset.
+ * Before starting, if an existing session file is found for this sessionId,
+ * it is deleted to force a fresh session.
  *
  * @param {string} sessionId - Unique session identifier.
- * @param {string} [title="Chrome"] - Browser title for the Baileys client tuple.
- * @param {boolean} [isLegacy=false] - (Unused legacy flag; kept for compatibility).
+ * @param {boolean} [isLegacy=false] - (Unused legacy flag).
  * @param {object} [options={}] - Additional options.
  * @param {boolean} [options.getPairCode=false] - (Unused here).
  * @param {boolean} [options.syncFullHistory=false] - (Not used since chats/contacts aren’t stored).
@@ -74,14 +73,18 @@ const createSession = async (
   isLegacy = false,
   options = {getPairCode: false, syncFullHistory: false, onQr: null}
 ) => {
-  const sessionFolder = "md_" + sessionId;
+  const sessionFile = "md_" + sessionId;
   const logger = pino({level: "silent"});
 
-  const {state, saveCreds} = await useMultiFileAuthState(sessionsDir(sessionFolder));
+  // Commented out store creation since we don't need to save message history.
+  // const store = makeInMemoryStore({ logger });
+  // If you want to enable the store in the future, simply uncomment the above line.
+
+  const {state, saveCreds} = await useMultiFileAuthState(sessionsDir(sessionFile));
 
   const waConfig = {
     auth: state,
-    printQRInTerminal: false,
+    printQRInTerminal: false, // Set to false if you don't want terminal output
     logger,
     browser: [title || "Chrome", "", ""],
     defaultQueryTimeoutMs: 0,
@@ -91,21 +94,46 @@ const createSession = async (
     generateHighQualityLinkPreview: true,
     syncFullHistory: options.syncFullHistory,
     getMessage: async key => {
-      // No message store in this build; return undefined.
+      // With store disabled, this will simply return undefined.
+      // If you want to use the store later, uncomment the lines below.
+      // if (store) {
+      //   const msg = await store.loadMessage(key?.remoteJid, key?.id);
+      //   return msg?.message;
+      // }
       return undefined;
     },
   };
 
   const wa = makeWASocket(waConfig);
-  // Keep a reference with a small extension (avoid spreading complex instance)
-  sessions.set(sessionId, Object.assign(wa, {isLegacy}));
+  // If you decide to re-enable the store in the future, uncomment these lines:
+  // if (!isLegacy) {
+  //   store.readFromFile(sessionsDir(`${sessionId}_store`));
+  //   store.bind(wa.ev);
+  // }
+  sessions.set(sessionId, {...wa, isLegacy /*, store*/});
   wa.ev.on("creds.update", saveCreds);
+
+  // Optional: Save chats if needed. (Commented out to disable message history storage)
+  // wa.ev.on("chats.set", ({ chats }) => {
+  //   const timestamp = Date.now();
+  //   saveDataToFile(chats, `${timestamp}-chats.json`);
+  //   // If using store: store.chats.insertIfAbsent(...chats);
+  // });
+
+  // Optional: Save contacts from messaging history. (Commented out)
+  // wa.ev.on("messaging-history.set", (data) => {
+  //   const contacts = data.contacts.filter((item) =>
+  //     item.id.endsWith("@s.whatsapp.net")
+  //   );
+  //   if (contacts.length > 0) {
+  //     createJsonFile(`${sessionId}_contacts`, contacts);
+  //   }
+  // });
 
   // Listen for message updates (e.g., poll updates)
   wa.ev.on("messages.update", async m => {
     const message = m[0];
     if (message?.update?.pollUpdates?.length > 0) {
-      // Use the getMessage function we provided to Baileys config
       const pollCreation = await waConfig.getMessage(message.key);
       if (pollCreation) {
         const pollMessage = getAggregateVotesInPollMessage({
@@ -126,12 +154,13 @@ const createSession = async (
           qrType: "update",
         });
       }
+      // console.log("Message update received:", message);
     }
   });
 
   // Log incoming messages
   wa.ev.on("messages.upsert", async m => {
-    const message = m.messages?.[0];
+    const message = m.messages[0];
 
     if (message?.key?.remoteJid !== "status@broadcast" && m.type === "notify" && message?.key?.remoteJid?.endsWith("@s.whatsapp.net")) {
       const uid = extractUidFromSessionId(sessionId);
@@ -159,7 +188,7 @@ const createSession = async (
       // Update instance status to ACTIVE in the DB
       try {
         const sessionData = getSession(sessionId);
-        const userData = sessionData?.user; // populated after "open"
+        const userData = sessionData?.authState?.creds?.me || sessionData.user;
         console.dir({userData}, {depth: null});
 
         await query("UPDATE instance SET status = ?, number = ?, data = ? WHERE uniqueId = ?", [
@@ -169,8 +198,7 @@ const createSession = async (
           sessionId,
         ]);
 
-        // Optionally de-duplicate instances:
-        // await updateDuplicateInstance({
+        // updateDuplicateInstance({
         //   sessionId,
         //   number: extractPhoneNumber(userData?.id),
         //   userData,
@@ -190,14 +218,14 @@ const createSession = async (
         deleteSession(sessionId, isLegacy);
         return;
       }
-      const waitMs = statusCode === DisconnectReason.restartRequired ? 0 : 5000;
-      console.log(`Reconnecting session ${sessionId} in ${waitMs}ms...`);
-      setTimeout(() => createSession(sessionId, "Chrome", isLegacy, options), waitMs);
+      console.log(`Reconnecting session ${sessionId} in ${statusCode === DisconnectReason.restartRequired ? 0 : 5000}ms...`);
+      setTimeout(() => createSession(sessionId, isLegacy, options), statusCode === DisconnectReason.restartRequired ? 0 : 5000);
     }
 
     if (qr) {
       try {
         const qrCodeImage = await toDataURL(qr);
+        // console.log(`QR code for session ${sessionId}:`, qrCodeImage);
         // Update instance data with the latest QR code
         try {
           await query("UPDATE instance SET qr = ? WHERE uniqueId = ?", [qrCodeImage, sessionId]);
@@ -210,22 +238,15 @@ const createSession = async (
         // Start a 60-second timeout: if not scanned, logout and delete.
         setTimeout(async () => {
           const sessionInstance = getSession(sessionId);
-          try {
-            // If creds are not registered yet, it's not scanned.
-            const notScanned = sessionInstance && sessionInstance?.authState && !sessionInstance.authState.creds?.registered;
-
-            if (notScanned) {
-              console.log(`Session ${sessionId} was not scanned in time. Logging out and deleting session.`);
-              try {
-                await sessionInstance.logout();
-              } catch (err) {
-                console.error("Error during logout:", err);
-              } finally {
-                deleteSession(sessionId, isLegacy);
-              }
+          if (sessionInstance && sessionInstance.state && !sessionInstance.state.creds.registered) {
+            console.log(`Session ${sessionId} was not scanned in time. Logging out and deleting session.`);
+            try {
+              await sessionInstance.logout();
+            } catch (err) {
+              console.error("Error during logout:", err);
+            } finally {
+              deleteSession(sessionId, isLegacy);
             }
-          } catch (err) {
-            console.error("QR timeout check error:", err);
           }
         }, 60000);
       } catch (error) {
@@ -262,7 +283,8 @@ const deleteDirectory = directoryPath => {
  * @param {boolean} [isLegacy=false]
  */
 const deleteSession = async (sessionId, isLegacy = false) => {
-  const sessionFolder = "md_" + sessionId;
+  const sessionFile = "md_" + sessionId;
+  const storeFile = `${sessionId}_store`;
   const baseDir = process.cwd();
 
   // Remove contacts file if exists
@@ -270,14 +292,14 @@ const deleteSession = async (sessionId, isLegacy = false) => {
   if (fs.existsSync(contactsPath)) {
     fs.unlinkSync(contactsPath);
   }
-
-  if (isSessionFolderExists(sessionFolder)) {
-    deleteDirectory(sessionsDir(sessionFolder));
+  if (isSessionFileExists(sessionFile)) {
+    deleteDirectory(sessionsDir(sessionFile));
   }
-
+  if (isSessionFileExists(storeFile)) {
+    fs.unlinkSync(sessionsDir(storeFile));
+  }
   sessions.delete(sessionId);
   retries.delete(sessionId);
-
   // Update instance status to INACTIVE in the DB
   try {
     await query("UPDATE instance SET status = ? WHERE uniqueId = ?", ["INACTIVE", sessionId]);
@@ -502,28 +524,21 @@ async function updateDuplicateInstance({sessionId, number, userData}) {
 }
 
 /**
- * Reads the sessions folder and automatically creates sessions for saved folders.
+ * Reads the sessions folder and automatically creates sessions for saved files.
  */
 const init = () => {
   const sessionsPath = path.join(process.cwd(), "sessions");
-  fs.readdir(sessionsPath, (err, items) => {
+  fs.readdir(sessionsPath, (err, files) => {
     if (err) {
       console.error("Error reading sessions directory:", err);
       return;
     }
-    items.forEach(name => {
-      const full = path.join(sessionsPath, name);
-      let stat;
-      try {
-        stat = fs.statSync(full);
-      } catch {
-        return;
-      }
-      if (!stat.isDirectory()) return;
-      if (!name.startsWith("md_")) return;
-      const sessionId = name.substring(3);
-      // title, isLegacy=false (we only use MD-style multi-file auth)
-      createSession(sessionId, "Chrome", false);
+    files.forEach(file => {
+      if (!file.endsWith(".json") || !file.startsWith("md_") || file.includes("_store")) return;
+      const filename = file.replace(".json", "");
+      const isLegacy = !filename.startsWith("md_");
+      const sessionId = isLegacy ? filename.substring(7) : filename.substring(3);
+      createSession(sessionId, isLegacy);
     });
   });
 };
@@ -534,7 +549,7 @@ function checkQr() {
 }
 
 module.exports = {
-  isSessionExists: sessionId => sessions.has(sessionId),
+  isSessionExists,
   createSession,
   getSession,
   deleteSession,
