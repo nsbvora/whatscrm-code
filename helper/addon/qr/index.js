@@ -28,6 +28,10 @@ function extractUidFromSessionId(input) {
 const sessions = new Map();
 const retries = new Map();
 
+// top-level:
+const qrTimeouts = new Map(); // sessionId -> timeoutId
+const registeredFlags = new Map(); // sessionId -> boolean
+
 function extractPhoneNumber(str) {
   if (!str) return null;
   const match = str.match(/^(\d+)(?=:|\@)/);
@@ -122,9 +126,32 @@ const createSession = async (
 
     // keep a reference (avoid spreading instance)
     sessions.set(sessionId, Object.assign(wa, {isLegacy}));
-    wa.ev.on("creds.update", () => {
+    // wa.ev.on("creds.update", () => {
+    //   log(sessionId, "creds.update fired → saving creds");
+    //   saveCreds().catch(e => errlog(sessionId, "saveCreds error:", e?.stack || e));
+    // });
+
+    wa.ev.on("creds.update", async () => {
       log(sessionId, "creds.update fired → saving creds");
-      saveCreds().catch(e => errlog(sessionId, "saveCreds error:", e?.stack || e));
+      try {
+        await saveCreds();
+      } catch (e) {
+        errlog(sessionId, "saveCreds error:", e?.stack || e);
+      }
+
+      // If creds are registered, cancel any pending QR timeout
+      try {
+        const isReg = state?.creds?.registered === true;
+        if (isReg) {
+          registeredFlags.set(sessionId, true);
+          const t = qrTimeouts.get(sessionId);
+          if (t) {
+            clearTimeout(t);
+            qrTimeouts.delete(sessionId);
+            log(sessionId, "creds.registered=true → cleared QR timeout");
+          }
+        }
+      } catch {}
     });
 
     // Message updates (polls etc.)
@@ -218,6 +245,14 @@ const createSession = async (
         } catch (e) {
           errlog(sessionId, "DB update error (open):", e?.stack || e);
         }
+        const t = qrTimeouts.get(sessionId);
+        if (t) {
+          clearTimeout(t);
+          qrTimeouts.delete(sessionId);
+          log(sessionId, "connection open → cleared QR timeout");
+        }
+        registeredFlags.set(sessionId, true);
+        // ... rest of your ACTIVE DB update code
         return;
       }
 
@@ -265,9 +300,39 @@ const createSession = async (
           }
 
           // 60s timeout — if not scanned, clean up
-          setTimeout(async () => {
+          // setTimeout(async () => {
+          //   const sessionInstance = getSession(sessionId);
+          //   const notScanned = sessionInstance && sessionInstance?.authState && !sessionInstance.authState.creds?.registered;
+
+          //   log(sessionId, "QR scan timeout check → notScanned:", notScanned);
+          //   if (notScanned) {
+          //     log(sessionId, "Not scanned in time → logging out & deleting");
+          //     try {
+          //       await sessionInstance.logout();
+          //       log(sessionId, "logout() success");
+          //     } catch (e) {
+          //       errlog(sessionId, "Error during logout:", e?.stack || e);
+          //     } finally {
+          //       deleteSession(sessionId, isLegacy);
+          //     }
+          //   }
+          // }, 60000);
+          const timeoutMs = 300000; // 5 minutes (more realistic)
+          const prev = qrTimeouts.get(sessionId);
+          if (prev) clearTimeout(prev);
+          const timer = setTimeout(async () => {
+            // If already registered/open by now, do nothing
+            if (registeredFlags.get(sessionId) === true) {
+              log(sessionId, "QR timeout fired but session is registered → ignore");
+              qrTimeouts.delete(sessionId);
+              return;
+            }
             const sessionInstance = getSession(sessionId);
-            const notScanned = sessionInstance && sessionInstance?.authState && !sessionInstance.authState.creds?.registered;
+            const notScanned =
+              sessionInstance &&
+              state && // use the closure state, not sessionInstance.authState
+              state.creds &&
+              !state.creds.registered;
 
             log(sessionId, "QR scan timeout check → notScanned:", notScanned);
             if (notScanned) {
@@ -281,7 +346,9 @@ const createSession = async (
                 deleteSession(sessionId, isLegacy);
               }
             }
-          }, 60000);
+            qrTimeouts.delete(sessionId);
+          }, timeoutMs);
+          qrTimeouts.set(sessionId, timer);
         } catch (e) {
           errlog(sessionId, "QR processing error:", e?.stack || e);
         }
